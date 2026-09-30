@@ -2,10 +2,109 @@ import { Hono } from 'hono'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { html, raw } from 'hono/html'
 
-type Bindings = { DB: D1Database }
+// ── Environment (Cloudflare Worker secrets or vite process.env in dev) ────────
+type Bindings = {
+  GOOGLE_SHEET_ID?: string
+  GOOGLE_SHEET_TAB?: string
+  GOOGLE_SERVICE_ACCOUNT_BASE64?: string
+  GOOGLE_CALENDAR_ID?: string
+  RESEND_API_KEY?: string
+  EMAIL_FROM?: string
+  WEBHOOK_SECRET?: string
+}
+
 const app = new Hono<{ Bindings: Bindings }>()
 app.use('/static/*', serveStatic({ root: './public' }))
 app.get('/api/health', (c) => c.json({ status: 'ok' }))
+
+// ── Google Auth helper (Service Account → JWT → access token) ─────────────────
+async function getGoogleAccessToken(serviceAccountBase64: string, scope: string): Promise<string> {
+  const json = JSON.parse(atob(serviceAccountBase64))
+  const now = Math.floor(Date.now() / 1000)
+  const header = btoa(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  const payload = btoa(JSON.stringify({
+    iss: json.client_email, scope, aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600, iat: now
+  })).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  // Import PEM private key
+  const pem = json.private_key.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\n/g, '')
+  const keyDer = Uint8Array.from(atob(pem), c => c.charCodeAt(0))
+  const cryptoKey = await crypto.subtle.importKey('pkcs8', keyDer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign'])
+  const sigBuf = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', cryptoKey, new TextEncoder().encode(`${header}.${payload}`))
+  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  const jwt = `${header}.${payload}.${sig}`
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
+  })
+  const data = await res.json() as { access_token: string }
+  return data.access_token
+}
+
+// ── Append row to Google Sheets ───────────────────────────────────────────────
+async function appendToSheet(token: string, sheetId: string, tab: string, values: string[]): Promise<void> {
+  const range = encodeURIComponent(`${tab}!A1`)
+  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [values] })
+  })
+}
+
+// ── Create Google Calendar event with Meet link ───────────────────────────────
+async function createMeetEvent(token: string, calendarId: string, enquiry: {
+  name: string; email: string; organisation: string; interest: string;
+  preferredDate: string; preferredTime: string; rowId: string;
+}): Promise<string> {
+  // Parse date and time — fallback to tomorrow 10am if not set
+  let start: string, end: string
+  if (enquiry.preferredDate && enquiry.preferredTime) {
+    const dt = new Date(`${enquiry.preferredDate}T${enquiry.preferredTime}:00`)
+    const dtEnd = new Date(dt.getTime() + 60 * 60 * 1000) // 1-hour meeting
+    start = dt.toISOString()
+    end = dtEnd.toISOString()
+  } else if (enquiry.preferredDate) {
+    start = `${enquiry.preferredDate}T10:00:00`
+    end = `${enquiry.preferredDate}T11:00:00`
+  } else {
+    const tomorrow = new Date(Date.now() + 86400000)
+    const ds = tomorrow.toISOString().split('T')[0]
+    start = `${ds}T10:00:00`
+    end = `${ds}T11:00:00`
+  }
+  const event = {
+    summary: `Zatics Consultation — ${enquiry.name} (${enquiry.organisation})`,
+    description: `Enquiry reference: ZI-${enquiry.rowId}\nArea of interest: ${enquiry.interest}`,
+    start: { dateTime: start, timeZone: 'UTC' },
+    end: { dateTime: end, timeZone: 'UTC' },
+    attendees: [{ email: enquiry.email }],
+    conferenceData: { createRequest: { requestId: enquiry.rowId, conferenceSolutionKey: { type: 'hangoutsMeet' } } }
+  }
+  const res = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?conferenceDataVersion=1&sendUpdates=all`,
+    { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(event) }
+  )
+  const data = await res.json() as { hangoutLink?: string; htmlLink?: string }
+  return data.hangoutLink || data.htmlLink || 'https://meet.google.com'
+}
+
+// ── Send email via Resend ─────────────────────────────────────────────────────
+async function sendEmail(apiKey: string, from: string, to: string | string[], subject: string, html: string): Promise<void> {
+  const recipients = Array.isArray(to) ? to : [to]
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from, to: recipients, subject, html })
+  })
+  if (!res.ok) {
+    const errText = await res.text()
+    console.error('[Resend Error]', res.status, errText)
+    throw new Error(`Resend email failed (${res.status}): ${errText}`)
+  }
+}
+
+// ── POST /api/enquiries — Save to Google Sheets ───────────────────────────────
 app.post('/api/enquiries', async (c) => {
   const origin = c.req.header('origin')
   if (origin && origin !== new URL(c.req.url).origin) return c.json({ error: 'Please submit from this website.' }, 403)
@@ -13,20 +112,146 @@ app.post('/api/enquiries', async (c) => {
   try {
     const data = await c.req.json()
     if (data.website) return c.json({ success: true })
-    const name = String(data.name || '').trim(), email = String(data.email || '').trim(), organisation = String(data.organisation || '').trim(), interest = String(data.interest || '').trim(), message = String(data.message || '').trim()
-    if (!name || name.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !organisation || organisation.length > 150 || message.length < 10 || message.length > 3000 || interest.length > 100) return c.json({ error: 'Please check your details and include at least 10 characters about your project.' }, 400)
-    if (!c.env.DB) return c.json({ error: 'Our enquiry service is temporarily unavailable. Please try again later.' }, 503)
-    const recent = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM enquiries WHERE email = ? AND created_at > datetime('now', '-1 hour')").bind(email.toLowerCase()).first<{ count: number }>()
-    if (recent && recent.count >= 3) return c.json({ error: 'Your enquiries have been received. Please wait before submitting another.' }, 429)
-    const id = crypto.randomUUID()
-    await c.env.DB.prepare('INSERT INTO enquiries (id, name, email, organisation, interest, message) VALUES (?, ?, ?, ?, ?, ?)').bind(id, name, email.toLowerCase(), organisation, interest, message).run()
-    return c.json({ success: true, reference: id.slice(0, 8).toUpperCase() }, 201)
+    const name = String(data.name || '').trim()
+    const email = String(data.email || '').trim()
+    const organisation = String(data.organisation || '').trim()
+    const interest = String(data.interest || '').trim()
+    const message = String(data.message || '').trim()
+    const preferredDate = String(data.preferred_date || '').trim()
+    const preferredTime = String(data.preferred_time || '').trim()
+    if (!name || name.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !organisation || organisation.length > 150 || message.length < 10 || message.length > 3000 || interest.length > 100)
+      return c.json({ error: 'Please check your details and include at least 10 characters about your project.' }, 400)
+
+    const sheetId = c.env?.GOOGLE_SHEET_ID || (typeof process !== 'undefined' ? process.env.GOOGLE_SHEET_ID : '') || ''
+    const tab = c.env?.GOOGLE_SHEET_TAB || (typeof process !== 'undefined' ? process.env.GOOGLE_SHEET_TAB : '') || 'Enquiries'
+    const saB64 = c.env?.GOOGLE_SERVICE_ACCOUNT_BASE64 || (typeof process !== 'undefined' ? process.env.GOOGLE_SERVICE_ACCOUNT_BASE64 : '') || ''
+
+    const reference = crypto.randomUUID().slice(0, 8).toUpperCase()
+    const submittedAt = new Date().toISOString()
+
+    if (sheetId && saB64) {
+      const token = await getGoogleAccessToken(saB64, 'https://www.googleapis.com/auth/spreadsheets')
+      // Columns: ID | Name | Email | Organisation | Interest | Message | Preferred Date | Preferred Time | Submitted At | Status
+      await appendToSheet(token, sheetId, tab, [
+        reference, name, email, organisation, interest, message,
+        preferredDate, preferredTime, submittedAt, 'Pending'
+      ])
+    } else {
+      console.warn('[Zatics] Google Sheets not configured — enquiry not persisted.')
+    }
+
+    return c.json({ success: true, reference }, 201)
   } catch (error) {
     if (error instanceof SyntaxError) return c.json({ error: 'Invalid request.' }, 400)
-    console.error('Enquiry storage unavailable')
+    console.error('Enquiry storage error:', error)
     return c.json({ error: 'We could not save your enquiry. Please try again shortly.' }, 503)
   }
 })
+
+// ── POST /api/webhook/status — Called by Google Apps Script on status change ──
+// Body: { secret, reference, name, email, organisation, interest, message,
+//         preferred_date, preferred_time, submitted_at, status: 'Approve'|'Decline' }
+app.post('/api/webhook/status', async (c) => {
+  try {
+    const body = await c.req.json() as Record<string, string>
+    const expectedSecret = c.env?.WEBHOOK_SECRET || (typeof process !== 'undefined' ? process.env.WEBHOOK_SECRET : '') || ''
+    if (!expectedSecret || body.secret !== expectedSecret) return c.json({ error: 'Unauthorized' }, 401)
+
+    const { reference, name, email, organisation, interest, message, preferred_date, preferred_time, status } = body
+    if (!email || !name || !status) return c.json({ error: 'Missing required fields.' }, 400)
+
+    const resendKey = c.env?.RESEND_API_KEY || (typeof process !== 'undefined' ? process.env.RESEND_API_KEY : '') || ''
+    const fromEmail = c.env?.EMAIL_FROM || (typeof process !== 'undefined' ? process.env.EMAIL_FROM : '') || 'noreply@zatics.ai'
+    const saB64 = c.env?.GOOGLE_SERVICE_ACCOUNT_BASE64 || (typeof process !== 'undefined' ? process.env.GOOGLE_SERVICE_ACCOUNT_BASE64 : '') || ''
+    const calendarId = c.env?.GOOGLE_CALENDAR_ID || (typeof process !== 'undefined' ? process.env.GOOGLE_CALENDAR_ID : '') || 'primary'
+
+    if (status === 'Approve') {
+      // Create a Google Meet event
+      let meetLink = 'https://meet.google.com'
+      if (saB64) {
+        const calToken = await getGoogleAccessToken(saB64, 'https://www.googleapis.com/auth/calendar')
+        meetLink = await createMeetEvent(calToken, calendarId, { name, email, organisation, interest, preferredDate: preferred_date || '', preferredTime: preferred_time || '', rowId: reference || crypto.randomUUID().slice(0, 8) })
+      }
+      const scheduleNote = (preferred_date || preferred_time)
+        ? `<p style="margin:0 0 8px">📅 <strong>Scheduled for:</strong> ${preferred_date || 'TBD'}${preferred_time ? ' at ' + preferred_time : ''}</p>`
+        : '<p style="margin:0 0 8px">📅 <strong>Schedule:</strong> We will confirm the exact time shortly.</p>'
+      await sendEmail(resendKey, fromEmail, email, `Your AI consultation is confirmed — Zatics Intelligence`, `
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Consultation Confirmed</title></head>
+<body style="margin:0;padding:0;background:#090b0a;font-family:'DM Sans',sans-serif;color:#eeefea">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:48px 20px">
+<table width="600" style="background:#10170d;border:1px solid #2e3d20;border-radius:12px;overflow:hidden">
+  <tr><td style="background:#10170d;padding:32px 40px 0;text-align:center">
+    <p style="margin:0 0 12px;font-size:9px;letter-spacing:2px;color:#8a9f70;font-family:monospace">ZATICS INTELLIGENCE</p>
+    <h1 style="margin:0;font-size:32px;font-weight:500;letter-spacing:-1.5px;color:#eeefea">Your consultation<br/><span style="color:#d1f89a">is confirmed.</span></h1>
+  </td></tr>
+  <tr><td style="padding:28px 40px">
+    <p style="margin:0 0 20px;font-size:14px;color:#93a381;line-height:1.7">Hi <strong style="color:#eeefea">${name}</strong>,<br/><br/>
+    We're excited to connect with you about building AI for <strong style="color:#eeefea">${organisation}</strong>.<br/>
+    Below are the details of your consultation.</p>
+    <div style="background:#141c10;border:1px solid #2e3d20;border-radius:8px;padding:20px 24px;margin:0 0 24px">
+      <p style="margin:0 0 8px;font-size:10px;letter-spacing:1px;color:#8a9f70;font-family:monospace">ENQUIRY DETAILS</p>
+      <p style="margin:0 0 8px"><strong>Reference:</strong> ZI-${reference}</p>
+      <p style="margin:0 0 8px"><strong>Name:</strong> ${name}</p>
+      <p style="margin:0 0 8px"><strong>Organisation:</strong> ${organisation}</p>
+      <p style="margin:0 0 8px"><strong>Area of Interest:</strong> ${interest}</p>
+      <p style="margin:0 0 8px"><strong>Your message:</strong><br/><span style="color:#93a381">${message.replace(/\n/g, '<br/>')}</span></p>
+      ${scheduleNote}
+    </div>
+    <div style="text-align:center;margin:28px 0">
+      <a href="${meetLink}" style="display:inline-block;background:#d1f89a;color:#172011;font-size:14px;font-weight:600;padding:16px 32px;border-radius:6px;text-decoration:none;letter-spacing:-0.3px">
+        🎥 Join Google Meet
+      </a>
+      <p style="margin:12px 0 0;font-size:11px;color:#5e6e51;font-family:monospace">${meetLink}</p>
+    </div>
+    <p style="margin:24px 0 0;font-size:12px;color:#5e6e51;line-height:1.7;text-align:center">
+      If you have any questions before the call, reply to this email.<br/>
+      Looking forward to talking — <strong style="color:#93a381">Zatics Intelligence</strong>
+    </p>
+  </td></tr>
+  <tr><td style="background:#0a0f08;padding:20px 40px;text-align:center;border-top:1px solid #1e2a14">
+    <p style="margin:0;font-size:9px;letter-spacing:1px;color:#3e4e30;font-family:monospace">© ${new Date().getFullYear()} ZATICS INTELLIGENCE · PURPOSE-BUILT. PRODUCTION-READY.</p>
+  </td></tr>
+</table></td></tr></table></body></html>`)
+
+    } else if (status === 'Decline') {
+      await sendEmail(resendKey, fromEmail, email, `Regarding your enquiry — Zatics Intelligence`, `
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Enquiry Update</title></head>
+<body style="margin:0;padding:0;background:#090b0a;font-family:'DM Sans',sans-serif;color:#eeefea">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:48px 20px">
+<table width="600" style="background:#10170d;border:1px solid #2e3d20;border-radius:12px;overflow:hidden">
+  <tr><td style="padding:32px 40px 0;text-align:center">
+    <p style="margin:0 0 12px;font-size:9px;letter-spacing:2px;color:#8a9f70;font-family:monospace">ZATICS INTELLIGENCE</p>
+    <h1 style="margin:0;font-size:32px;font-weight:500;letter-spacing:-1.5px;color:#eeefea">Thank you for<br/><span style="color:#93a381">reaching out.</span></h1>
+  </td></tr>
+  <tr><td style="padding:28px 40px">
+    <p style="margin:0 0 20px;font-size:14px;color:#93a381;line-height:1.7">Hi <strong style="color:#eeefea">${name}</strong>,<br/><br/>
+    Thank you for taking the time to share your challenge with us — we genuinely appreciate your interest in Zatics Intelligence.<br/><br/>
+    After reviewing your enquiry carefully, we don't believe we're the right fit for your current needs at this stage. We want to be honest with you rather than commit to something that wouldn't deliver real value.<br/><br/>
+    This may change as your requirements evolve, and we'd always welcome the opportunity to revisit the conversation in the future.</p>
+    <div style="background:#141c10;border:1px solid #2e3d20;border-radius:8px;padding:20px 24px;margin:0 0 24px">
+      <p style="margin:0 0 4px;font-size:10px;letter-spacing:1px;color:#8a9f70;font-family:monospace">YOUR REFERENCE</p>
+      <p style="margin:0;font-family:monospace;font-size:13px;color:#d1f89a">ZI-${reference}</p>
+    </div>
+    <p style="margin:0;font-size:12px;color:#5e6e51;line-height:1.7;text-align:center">
+      We wish you and <strong style="color:#93a381">${organisation}</strong> every success.<br/>
+      — <strong style="color:#93a381">The Zatics Intelligence team</strong>
+    </p>
+  </td></tr>
+  <tr><td style="background:#0a0f08;padding:20px 40px;text-align:center;border-top:1px solid #1e2a14">
+    <p style="margin:0;font-size:9px;letter-spacing:1px;color:#3e4e30;font-family:monospace">© ${new Date().getFullYear()} ZATICS INTELLIGENCE · PURPOSE-BUILT. PRODUCTION-READY.</p>
+  </td></tr>
+</table></td></tr></table></body></html>`)
+    } else {
+      return c.json({ error: 'Invalid status. Use "Approve" or "Decline".' }, 400)
+    }
+
+    return c.json({ success: true })
+  } catch (error) {
+    console.error('Webhook error:', error)
+    return c.json({ error: 'Webhook processing failed.' }, 500)
+  }
+})
+
 
 const arrow = html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>`
 const diagonal = html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg>`
@@ -92,6 +317,6 @@ app.get('/', (c) => c.html(html`<!DOCTYPE html>
 ].map(([title,sub,desc,tags],idx) => html`<details class="approach-step" name="approach" ${idx===0?html`open`:''}><summary><span class="approach-index">0${idx+1}</span><div><h3>${title}</h3><p>${sub}</p></div><span class="approach-plus">+</span></summary><div class="approach-detail"><p>${desc}</p><span>${tags}</span></div></details>`)}</div></div></section>
 <section class="cta-section" id="contact"><div class="cta-grid" aria-hidden="true"></div><div class="container cta-inner reveal"><p class="eyebrow"><span class="status-dot"></span> YOUR NEXT CHAPTER STARTS HERE</p><h2>Don’t just adopt AI.<br/><span class="muted">Build an intelligent</span><br/>organisation.</h2><p>Let’s engineer what comes next.</p><button class="button button-primary" data-contact>Start a conversation ${diagonal}</button><span class="cta-footnote">YOUR CHALLENGE. OUR ENGINEERING. REAL POSSIBILITIES.</span></div></section>
 </main><footer class="site-footer"><div class="container"><div class="footer-top"><a class="brand" href="#" aria-label="Zatics Intelligence home">${mark}<span>ZATICS<span class="brand-subtitle">INTELLIGENCE</span></span></a><p>Autonomous systems.<br/>Real-world intelligence.</p><nav aria-label="Footer navigation"><a href="#what-we-build">What we build</a><a href="#technology">Technology</a><a href="#approach">Our approach</a><button data-contact>Get in touch ${diagonal}</button></nav></div><div class="footer-bottom"><span>© ${new Date().getFullYear()} Zatics Intelligence. All rights reserved.</span><span class="footer-signature"><span class="status-dot"></span> ENGINEERED FOR WHAT’S NEXT.</span><button class="back-to-top" id="back-to-top">Back to top ↑</button></div></div></footer>
-<dialog id="contact-dialog" class="contact-dialog" aria-labelledby="contact-title"><button class="dialog-close" id="dialog-close" aria-label="Close enquiry form">×</button><div id="contact-form-view"><p class="eyebrow"><span class="status-dot"></span> LET’S BUILD WHAT’S NEXT</p><h2 id="contact-title">What could intelligence<br/><span class="muted">do for your organisation?</span></h2><p class="dialog-intro">Tell us about your challenge. Let’s find the right starting point.</p><form id="contact-form"><div class="form-row"><label>Your name<input name="name" autocomplete="name" maxlength="100" placeholder="Alex Morgan" required/></label><label>Work email<input name="email" type="email" autocomplete="email" maxlength="254" placeholder="alex@company.com" required/></label></div><label>Organisation<input name="organisation" autocomplete="organization" maxlength="150" placeholder="Your organisation" required/></label><label>Area of interest<select name="interest" id="contact-interest"><option>Let’s explore together</option><option>Autonomous AI Agents</option><option>Multi-Agent Systems</option><option>AI Automation</option><option>Enterprise Intelligence</option><option>Voice AI</option><option>AI Infrastructure</option></select></label><label>What would you like to make possible?<textarea name="message" rows="3" minlength="10" maxlength="3000" placeholder="A workflow to rethink. A challenge to solve. An idea to explore." required></textarea></label><label class="honeypot" aria-hidden="true">Website<input name="website" tabindex="-1" autocomplete="off"/></label><p class="form-privacy">Your details are stored securely to handle your enquiry. Please don’t include confidential or sensitive business information.</p><p class="form-error" id="form-error" role="alert" hidden></p><button type="submit" class="button button-primary form-submit">Send your enquiry ${diagonal}</button></form></div><div id="contact-success" class="contact-success" hidden><div class="success-symbol">✓</div><p class="eyebrow">ENQUIRY RECEIVED</p><h2>A meaningful<br/><span class="accent">first step.</span></h2><p>Your project brief has been saved. Thank you for sharing what you’re looking to build with Zatics Intelligence.</p><span id="enquiry-reference" class="enquiry-reference"></span><button class="button button-outline" id="success-close">Back to exploring ${arrow}</button></div></dialog>
+<dialog id="contact-dialog" class="contact-dialog" aria-labelledby="contact-title"><button class="dialog-close" id="dialog-close" aria-label="Close enquiry form">×</button><div id="contact-form-view"><p class="eyebrow"><span class="status-dot"></span> LET’S BUILD WHAT’S NEXT</p><h2 id="contact-title">What could intelligence<br/><span class="muted">do for your organisation?</span></h2><p class="dialog-intro">Tell us about your challenge. Let’s find the right starting point.</p><form id="contact-form"><div class="form-row"><label>Your name<input name="name" autocomplete="name" maxlength="100" placeholder="Alex Morgan" required/></label><label>Work email<input name="email" type="email" autocomplete="email" maxlength="254" placeholder="alex@company.com" required/></label></div><label>Organisation<input name="organisation" autocomplete="organization" maxlength="150" placeholder="Your organisation" required/></label><label>Area of interest<select name="interest" id="contact-interest"><option>Let’s explore together</option><option>Autonomous AI Agents</option><option>Multi-Agent Systems</option><option>AI Automation</option><option>Enterprise Intelligence</option><option>Voice AI</option><option>AI Infrastructure</option></select></label><div class="schedule-section"><div class="schedule-section-header"><span class="schedule-section-label"><span class="status-dot"></span> Preferred Consultation Schedule</span><span class="schedule-section-badge">Optional</span></div><div class="form-row"><label>Preferred date<input type="date" name="preferred_date" id="contact-date" aria-label="Preferred consultation date"/></label><label>Preferred time<input type="time" name="preferred_time" id="contact-time" step="900" aria-label="Preferred consultation time"/></label></div><div class="schedule-slots" role="group" aria-label="Quick time slots"><span class="schedule-slots-title">Quick slots:</span><button type="button" class="slot-pill" data-time="10:00">10:00 AM</button><button type="button" class="slot-pill" data-time="14:00">02:00 PM</button><button type="button" class="slot-pill" data-time="16:30">04:30 PM</button><button type="button" class="slot-pill" data-time="18:00">06:00 PM</button></div></div><label>What would you like to make possible?<textarea name="message" rows="3" minlength="10" maxlength="3000" placeholder="A workflow to rethink. A challenge to solve. An idea to explore." required></textarea></label><label class="honeypot" aria-hidden="true">Website<input name="website" tabindex="-1" autocomplete="off"/></label><p class="form-privacy">Your details are stored securely to handle your enquiry. Please don’t include confidential or sensitive business information.</p><p class="form-error" id="form-error" role="alert" hidden></p><button type="submit" class="button button-primary form-submit">Send your enquiry ${diagonal}</button></form></div><div id="contact-success" class="contact-success" hidden><div class="success-symbol">✓</div><p class="eyebrow">ENQUIRY RECEIVED</p><h2>A meaningful<br/><span class="accent">first step.</span></h2><p>Your project brief has been saved. Thank you for sharing what you’re looking to build with Zatics Intelligence.</p><div id="enquiry-schedule-summary" class="schedule-confirmation" hidden></div><span id="enquiry-reference" class="enquiry-reference"></span><button class="button button-outline" id="success-close">Back to exploring ${arrow}</button></div></dialog>
 <script src="/static/app.js" defer></script></body></html>`))
 export default app

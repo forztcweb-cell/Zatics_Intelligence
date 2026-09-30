@@ -644,6 +644,32 @@
           <option>AI Infrastructure</option>
         </select>
       </label>
+
+      <!-- PREFERRED CONSULTATION SCHEDULE (TIME & DATE) -->
+      <div class="schedule-section">
+        <div class="schedule-section-header">
+          <span class="schedule-section-label">
+            <span class="status-dot"></span> Preferred Consultation Schedule
+          </span>
+          <span class="schedule-section-badge">Optional</span>
+        </div>
+        <div class="form-row">
+          <label>Preferred date
+            <input type="date" name="preferred_date" id="contact-date" aria-label="Preferred consultation date" />
+          </label>
+          <label>Preferred time
+            <input type="time" name="preferred_time" id="contact-time" step="900" aria-label="Preferred consultation time" />
+          </label>
+        </div>
+        <div class="schedule-slots" role="group" aria-label="Quick time slots">
+          <span class="schedule-slots-title">Quick slots:</span>
+          <button type="button" class="slot-pill" data-time="10:00">10:00 AM</button>
+          <button type="button" class="slot-pill" data-time="14:00">02:00 PM</button>
+          <button type="button" class="slot-pill" data-time="16:30">04:30 PM</button>
+          <button type="button" class="slot-pill" data-time="18:00">06:00 PM</button>
+        </div>
+      </div>
+
       <label>What would you like to make possible?
         <textarea name="message" rows="3" minlength="10" maxlength="3000" placeholder="A workflow to rethink. A challenge to solve. An idea to explore." required></textarea>
       </label>
@@ -660,6 +686,7 @@
     <p class="eyebrow">ENQUIRY RECEIVED</p>
     <h2>A meaningful<br/><span class="accent">first step.</span></h2>
     <p>Your project brief has been saved. Thank you for sharing what you're looking to build with Zatics Intelligence.</p>
+    <div id="enquiry-schedule-summary" class="schedule-confirmation" hidden></div>
     <span id="enquiry-reference" class="enquiry-reference"></span>
     <button class="button button-outline" id="success-close">Back to exploring
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>

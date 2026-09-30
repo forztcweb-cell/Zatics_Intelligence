@@ -3,12 +3,15 @@
   "name": "webapp",
   "compatibility_date": "2026-09-08",
   "pages_build_output_dir": "./dist",
-  "compatibility_flags": ["nodejs_compat"],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "zatics-enquiries",
-      "database_id": "00000000-0000-0000-0000-000000000001"
-    }
-  ]
+  "compatibility_flags": ["nodejs_compat"]
+  // ─────────────────────────────────────────────────────────────────────────
+  // Set the following secrets via Cloudflare dashboard or:
+  //   wrangler secret put GOOGLE_SHEET_ID
+  //   wrangler secret put GOOGLE_SHEET_TAB
+  //   wrangler secret put GOOGLE_SERVICE_ACCOUNT_BASE64
+  //   wrangler secret put GOOGLE_CALENDAR_ID
+  //   wrangler secret put RESEND_API_KEY
+  //   wrangler secret put EMAIL_FROM
+  //   wrangler secret put WEBHOOK_SECRET
+  // ─────────────────────────────────────────────────────────────────────────
 }

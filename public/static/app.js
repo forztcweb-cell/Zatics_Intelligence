@@ -248,10 +248,43 @@
   // Real enquiries are persisted through the Hono API to Cloudflare D1.
   const dialog = $('#contact-dialog');
   const form = $('#contact-form');
+  const dateInput = $('#contact-date');
+  const timeInput = $('#contact-time');
+  const slotPills = $$('.slot-pill');
+  const scheduleSummary = $('#enquiry-schedule-summary');
   let lastFocused = null;
+
+  function updateMinDate() {
+    if (dateInput) {
+      const today = new Date().toISOString().split('T')[0];
+      dateInput.min = today;
+    }
+  }
+  updateMinDate();
+
+  slotPills.forEach(pill => {
+    pill.addEventListener('click', () => {
+      if (timeInput) {
+        timeInput.value = pill.dataset.time || '';
+        slotPills.forEach(p => p.classList.toggle('is-active', p === pill));
+      }
+    });
+  });
+
+  if (timeInput) {
+    timeInput.addEventListener('input', () => {
+      slotPills.forEach(p => p.classList.toggle('is-active', p.dataset.time === timeInput.value));
+    });
+  }
+
+  function resetSchedulePills() {
+    slotPills.forEach(p => p.classList.remove('is-active'));
+  }
+
   function closeDialog() { dialog.close(); lastFocused?.focus(); }
   $$('[data-contact]').forEach(button => button.addEventListener('click', () => {
     lastFocused = button; closeMenu();
+    updateMinDate();
     $('#contact-form-view').hidden = false;
     $('#contact-success').hidden = true;
     $('#form-error').hidden = true;
@@ -270,12 +303,39 @@
     try {
       const payload = Object.fromEntries(new FormData(form).entries());
       const response = await fetch('/api/enquiries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
-      const result = await response.json();
+      // Safely parse JSON — avoids "Unexpected end of JSON input" when server returns HTML or an empty body
+      let result;
+      try {
+        const text = await response.text();
+        result = text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error('The server returned an unexpected response. Please try again.');
+      }
       if (!response.ok) throw new Error(result.error || 'Unable to send your enquiry. Please try again.');
       if (!result.success) throw new Error('Your enquiry could not be confirmed. Please try again.');
       $('#contact-form-view').hidden = true; $('#contact-success').hidden = false;
       $('#enquiry-reference').textContent = result.reference ? `YOUR REFERENCE / ZI-${result.reference}` : '';
-      form.reset(); $('#success-close').focus();
+      if (scheduleSummary) {
+        if (payload.preferred_date || payload.preferred_time) {
+          const parts = [];
+          if (payload.preferred_date) {
+            try {
+              const d = new Date(payload.preferred_date + 'T00:00:00');
+              parts.push(d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+            } catch {
+              parts.push(payload.preferred_date);
+            }
+          }
+          if (payload.preferred_time) {
+            parts.push(`at ${payload.preferred_time}`);
+          }
+          scheduleSummary.innerHTML = `<span>CONSULTATION SCHEDULE REQUESTED</span><br/><strong>${parts.join(' ')}</strong>`;
+          scheduleSummary.hidden = false;
+        } else {
+          scheduleSummary.hidden = true;
+        }
+      }
+      form.reset(); resetSchedulePills(); $('#success-close').focus();
     } catch (err) {
       error.textContent = err.name === 'TimeoutError' || err.name === 'TypeError' ? 'Connection interrupted. Please check your connection and try again.' : err.message;
       error.hidden = false;
