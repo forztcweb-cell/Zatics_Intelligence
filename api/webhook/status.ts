@@ -1,17 +1,16 @@
-import { Hono } from 'hono'
-import { handle } from 'hono/vercel'
+import type { IncomingMessage, ServerResponse } from 'http'
+import { createSign } from 'crypto'
 
-export const config = {
-  runtime: 'nodejs'
+function parseServiceAccount(saB64OrJson: string) {
+  const trimmed = saB64OrJson.trim()
+  if (trimmed.startsWith('{')) return JSON.parse(trimmed)
+  const decoded = Buffer.from(trimmed, 'base64').toString('utf-8')
+  return JSON.parse(decoded)
 }
 
-const app = new Hono().basePath('/api')
-
-// ── Google Auth Helper (Service Account -> Access Token) ──────────────────────
-async function getGoogleToken(saB64: string, scope: string): Promise<string> {
-  const json = JSON.parse(Buffer.from(saB64, 'base64').toString('utf-8'))
+async function getGoogleToken(saB64OrJson: string, scope: string): Promise<string> {
+  const json = parseServiceAccount(saB64OrJson)
   const now = Math.floor(Date.now() / 1000)
-  const { createSign } = await import('crypto')
   const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url')
   const payload = Buffer.from(JSON.stringify({
     iss: json.client_email,
@@ -21,9 +20,14 @@ async function getGoogleToken(saB64: string, scope: string): Promise<string> {
     iat: now
   })).toString('base64url')
 
+  let privateKey = json.private_key
+  if (typeof privateKey === 'string') {
+    privateKey = privateKey.replace(/\\n/g, '\n')
+  }
+
   const sign = createSign('RSA-SHA256')
   sign.update(`${header}.${payload}`)
-  const sig = sign.sign(json.private_key, 'base64url')
+  const sig = sign.sign(privateKey, 'base64url')
   const jwt = `${header}.${payload}.${sig}`
 
   const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -31,34 +35,13 @@ async function getGoogleToken(saB64: string, scope: string): Promise<string> {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
   })
-  const data = await res.json() as { access_token: string }
-  if (!res.ok) {
-    throw new Error(`Google Auth failed: ${JSON.stringify(data)}`)
+  const data = await res.json() as { access_token?: string; error?: string }
+  if (!res.ok || !data.access_token) {
+    throw new Error(`Google Auth failed: ${data.error || res.statusText}`)
   }
   return data.access_token
 }
 
-// ── Append Row to Google Sheet ────────────────────────────────────────────────
-async function appendSheetRow(token: string, sheetId: string, tab: string, values: string[]): Promise<void> {
-  const range = encodeURIComponent(`${tab}!A1`)
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ values: [values] })
-    }
-  )
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`Google Sheets append failed (${res.status}): ${err}`)
-  }
-}
-
-// ── Google Calendar & Meet ───────────────────────────────────────────────────
 async function createCalendarMeet(token: string, calendarId: string, e: {
   name: string; email: string; organisation: string; interest: string;
   preferredDate: string; preferredTime: string; rowId: string;
@@ -99,7 +82,6 @@ async function createCalendarMeet(token: string, calendarId: string, e: {
   return d.hangoutLink || d.htmlLink || 'https://meet.google.com'
 }
 
-// ── Resend Email ─────────────────────────────────────────────────────────────
 async function sendResendEmail(apiKey: string, from: string, to: string | string[], subject: string, htmlBody: string): Promise<void> {
   const recipients = Array.isArray(to) ? to : [to]
   const res = await fetch('https://api.resend.com/emails', {
@@ -129,71 +111,49 @@ function buildDeclineEmail(p: { name: string; organisation: string; reference: s
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#090b0a;font-family:sans-serif;color:#eeefea"><table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:48px 20px"><table width="600" style="background:#10170d;border:1px solid #2e3d20;border-radius:12px;overflow:hidden"><tr><td style="padding:32px 40px 0;text-align:center"><p style="margin:0 0 12px;font-size:9px;letter-spacing:2px;color:#8a9f70;font-family:monospace">ZATICS INTELLIGENCE</p><h1 style="margin:0;font-size:32px;font-weight:500;color:#eeefea">Thank you for<br/><span style="color:#93a381">reaching out.</span></h1></td></tr><tr><td style="padding:28px 40px"><p style="margin:0 0 20px;font-size:14px;color:#93a381;line-height:1.7">Hi <strong style="color:#eeefea">${p.name}</strong>,<br/><br/>Thank you for taking the time to share your challenge with us — we genuinely appreciate your interest in Zatics Intelligence.<br/><br/>After reviewing your enquiry carefully, we don't believe we're the right fit for your current needs at this stage. This may change as your requirements evolve, and we'd welcome the opportunity to revisit this conversation in the future.</p><div style="background:#141c10;border:1px solid #2e3d20;border-radius:8px;padding:20px 24px;margin:0 0 24px"><p style="margin:0 0 4px;font-size:10px;letter-spacing:1px;color:#8a9f70;font-family:monospace">YOUR REFERENCE</p><p style="margin:0;font-family:monospace;font-size:13px;color:#d1f89a">ZI-${p.reference}</p></div><p style="margin:0;font-size:12px;color:#5e6e51;line-height:1.7;text-align:center">We wish you and <strong style="color:#93a381">${p.organisation}</strong> every success.<br/>— <strong style="color:#93a381">The Zatics Intelligence team</strong></p></td></tr><tr><td style="background:#0a0f08;padding:20px 40px;text-align:center;border-top:1px solid #1e2a14"><p style="margin:0;font-size:9px;letter-spacing:1px;color:#3e4e30;font-family:monospace">© ${yr} ZATICS INTELLIGENCE</p></td></tr></table></td></tr></table></body></html>`
 }
 
-// ── GET /api/health ──────────────────────────────────────────────────────────
-app.get('/health', (c) => c.json({ status: 'ok' }))
+export default async function handler(req: IncomingMessage & { body?: any }, res: ServerResponse) {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Content-Type', 'application/json')
 
-// ── POST /api/enquiries ──────────────────────────────────────────────────────
-app.post('/enquiries', async (c) => {
-  try {
-    const body = await c.req.json()
-    if (body.website) return c.json({ success: true })
-
-    const name = String(body.name || '').trim()
-    const email = String(body.email || '').trim()
-    const organisation = String(body.organisation || '').trim()
-    const interest = String(body.interest || '').trim()
-    const message = String(body.message || '').trim()
-    const preferredDate = String(body.preferred_date || '').trim()
-    const preferredTime = String(body.preferred_time || '').trim()
-
-    if (!name || name.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-        !organisation || organisation.length > 150 ||
-        message.length < 10 || message.length > 3000 || interest.length > 100) {
-      return c.json({ error: 'Please check your details and include at least 10 characters about your project.' }, 400)
-    }
-
-    const reference = Math.random().toString(36).slice(2, 10).toUpperCase()
-    const submittedAt = new Date().toISOString()
-
-    const sheetId = process.env.GOOGLE_SHEET_ID || ''
-    const tab = process.env.GOOGLE_SHEET_TAB || 'Enquiries'
-    const saB64 = process.env.GOOGLE_SERVICE_ACCOUNT_BASE64 || ''
-
-    if (sheetId && saB64) {
-      try {
-        const token = await getGoogleToken(saB64, 'https://www.googleapis.com/auth/spreadsheets')
-        await appendSheetRow(token, sheetId, tab, [
-          reference, name, email, organisation, interest, message,
-          preferredDate, preferredTime, submittedAt, 'Pending'
-        ])
-        console.log(`[Vercel API] Row appended to sheet: ZI-${reference}`)
-      } catch (e: any) {
-        console.error('[Vercel API] Google Sheets error:', e)
-        return c.json({ error: 'Could not save to spreadsheet. Please check server configuration.' }, 500)
-      }
-    } else {
-      console.warn(`[Vercel API] Sheet not configured. Reference: ZI-${reference}`)
-    }
-
-    return c.json({ success: true, reference }, 201)
-  } catch (err: any) {
-    console.error('[Vercel API] Enquiry error:', err)
-    return c.json({ error: err.message || 'Internal server error' }, 500)
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 200
+    res.end(JSON.stringify({ status: 'ok' }))
+    return
   }
-})
 
-// ── POST /api/webhook/status ─────────────────────────────────────────────────
-app.post('/webhook/status', async (c) => {
+  if (req.method !== 'POST') {
+    res.statusCode = 405
+    res.end(JSON.stringify({ error: 'Method not allowed' }))
+    return
+  }
+
   try {
-    const body = await c.req.json() as Record<string, string>
+    let bodyText = ''
+    if (typeof req.body === 'object' && req.body !== null) {
+      bodyText = JSON.stringify(req.body)
+    } else {
+      const chunks: Buffer[] = []
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+      }
+      bodyText = Buffer.concat(chunks).toString('utf-8')
+    }
+
+    const body = bodyText ? JSON.parse(bodyText) : {}
     const expectedSecret = process.env.WEBHOOK_SECRET || ''
     if (!expectedSecret || body.secret !== expectedSecret) {
-      return c.json({ error: 'Unauthorized' }, 401)
+      res.statusCode = 401
+      res.end(JSON.stringify({ error: 'Unauthorized' }))
+      return
     }
 
     const { reference, name, email, organisation, interest, message, preferred_date, preferred_time, status } = body
     if (!email || !name || !status) {
-      return c.json({ error: 'Missing required fields.' }, 400)
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'Missing required fields.' }))
+      return
     }
 
     const resendKey = process.env.RESEND_API_KEY || ''
@@ -213,7 +173,7 @@ app.post('/webhook/status', async (c) => {
             rowId: reference || 'ZI'
           })
         } catch (e) {
-          console.error('[Vercel API] Calendar error:', e)
+          console.error('[Vercel Webhook] Calendar error:', e)
         }
       }
       if (resendKey) {
@@ -229,14 +189,16 @@ app.post('/webhook/status', async (c) => {
         }))
       }
     } else {
-      return c.json({ error: 'Invalid status.' }, 400)
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'Invalid status.' }))
+      return
     }
 
-    return c.json({ success: true })
+    res.statusCode = 200
+    res.end(JSON.stringify({ success: true }))
   } catch (err: any) {
-    console.error('[Vercel API] Webhook error:', err)
-    return c.json({ error: err.message || 'Webhook failed.' }, 500)
+    console.error('[Vercel Webhook] Error:', err)
+    res.statusCode = 500
+    res.end(JSON.stringify({ error: err.message || 'Webhook failed.' }))
   }
-})
-
-export default handle(app)
+}
